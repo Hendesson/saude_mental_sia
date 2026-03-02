@@ -1,0 +1,177 @@
+---
+title: "teste quebras naturais limiar"
+author: "Eucilene Santana"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+## Ler banco de dados SIA 2008-2023
+
+```{r}
+# Banco fornecido pela Area tecnica, o do opendatasus está comrropido
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(classInt)
+library(scales)
+library(stringr)
+library(magrittr)
+library(tidyr)
+library(zoo)
+
+
+data_path <- file.path("data", "RM15_SIA_Mental.RData")
+if (!file.exists(data_path)) {
+  cat(
+    "### Dados não encontrados\n\n",
+    "Para gerar os gráficos, coloque o arquivo `RM15_SIA_Mental.RData` em `SIA_MENTAL/data/`.\n\n",
+    "Caminho esperado: `", normalizePath(data_path, winslash = "/", mustWork = FALSE), "`\n",
+    sep = ""
+  )
+  knitr::knit_exit()
+}
+
+load(data_path)
+
+colnames(RM15_SIA_Mental)
+
+SIA <- RM15_SIA_Mental %>%
+  select(pa_cmp,pa_cidcas,RM_nome) %>%
+  mutate(
+    ano = substr(pa_cmp, 1, 4),
+    mes = substr(pa_cmp, 5, 6),
+    data = ymd(paste0(ano, "-", mes, "-01"))
+  )
+
+```
+
+```{r}
+library(lubridate)
+SIA_mental <- SIA%>%
+  mutate(mes = factor(month(data),
+                 levels = 1:12,
+                 labels = c("Jan", "Fev", "Mar", "Abr", "Mai", "Jun",
+                            "Jul", "Ago", "Set", "Out", "Nov", "Dez")),
+    data1 = floor_date(data, unit = "month")
+  )
+
+    
+    
+```
+
+
+
+
+
+```{r}
+serie <- SIA_mental %>%
+  mutate(
+    ano = as.integer(substr(pa_cmp, 1, 4)),
+    mes = as.integer(substr(pa_cmp, 5, 6))
+  ) %>%
+  group_by(RM_nome, ano, mes) %>%
+  summarise(casos_totais = n(), .groups = "drop")
+
+```
+
+
+```{r}
+# ----------------- Padronizar serie (ano, mes -> eixo temporal) -----------------
+# serie deve ter: RM_nome, ano, mes (Jan..Dez ou 1..12), casos_totais
+ordem_meses <- c("Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez")
+
+serie <- serie%>%
+  mutate(
+    ano  = as.integer(ano),
+    mes  = as.character(mes),
+    mes_num = ifelse(grepl("^\\d+$", mes), as.integer(mes),
+                     match(substr(mes, 1, 3), ordem_meses)),
+    ym   = as.yearmon(sprintf("%04d-%02d", ano, mes_num), "%Y-%m"),
+    casos_totais = as.numeric(casos_totais)
+  ) %>%
+  filter(!is.na(ym), is.finite(casos_totais))
+```
+
+```{r}
+# ----------------- Calcular limiares por RM -----------------
+# limiar2 terá as colunas exigidas para pivot_longer()
+limiar2 <- serie %>%
+  group_by(RM_nome) %>%
+  reframe({
+    v <- casos_totais[is.finite(casos_totais)]
+    if (length(v) >= 5)      brks <- classIntervals(v, n = 5, style = "fisher")$brks
+    else if (length(v) > 1)  brks <- quantile(v, probs = seq(0,1,length.out=6), na.rm=TRUE)
+    else { u <- ifelse(length(v)==1, v[1], 0); brks <- rep(u, 6) }
+    tibble(
+      sem_risco = brks[1],
+      seguranca = brks[2],
+      baixo     = brks[3],
+      moderado  = brks[4],
+      alto      = brks[5]
+    )
+  })
+```
+
+```{r}
+# ----------------- Longo para plotagem -----------------
+limiar_long <- limiar2 %>%
+  pivot_longer(cols = -RM_nome, names_to = "categoria", values_to = "valor") %>%
+  mutate(categoria = factor(categoria, levels = c("sem_risco","seguranca","baixo","moderado","alto")),
+         valor = as.numeric(valor))
+```
+
+```{r}
+# ----------------- Paleta dos limiares -----------------
+cores_limiar <- c(
+  sem_risco = "#000099",
+  seguranca = "#009900",
+  baixo     = "#FFD166",
+  moderado  = "#ff8000",
+  alto      = "#cc0000"
+)
+
+# ----------------- Gráfico facetado -----------------
+
+# cor da série (azul)
+serie_cor <- "#0066CC"
+
+ordem_rm <- sort(unique(serie$RM_nome))
+serie <- mutate(serie, RM_nome = factor(RM_nome, levels = ordem_rm))
+limiar_long <- mutate(limiar_long, RM_nome = factor(RM_nome, levels = ordem_rm))
+
+ym_min <- min(serie$ym); ym_max <- max(serie$ym)
+breaks_ym <- seq(ym_min, ym_max, by = 8/12)  # a cada 8 meses
+
+g <- ggplot(serie, aes(x = ym, y = casos_totais)) +
+  geom_line(linewidth = 0.9, color = serie_cor) +
+  geom_point(size = 0.8, color = serie_cor) +
+  geom_hline(data = limiar_long,
+             aes(yintercept = valor, color = categoria),
+             inherit.aes = FALSE, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = cores_limiar, name = NULL, na.translate = FALSE) +
+  scale_x_yearmon(breaks = breaks_ym, format = "%b/%Y") +
+  labs(
+    title = "Série temporal de atendimentos de emergência em Saúde Mental nas 15 RMs",
+    subtitle = "Eixo mês/ano; linhas tracejadas = limiares",
+    x = "Mês/Ano", y = "Número de casos"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        panel.grid.minor = element_blank()) +
+  facet_wrap(~ RM_nome, ncol = 3, scales = "free_y")
+
+g
+```
+
