@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pyreadr
 
-from config_paths import DATA_DIR
+from config_paths import DATA_DIR, PROCESSED_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -117,55 +117,84 @@ class SIAData:
 
 
 class DataProcessor:
-    def __init__(self, data_filename: str = "RM15_SIA_Mental.RData"):
+    def __init__(
+        self,
+        data_filename: str = "RM15_SIA_Mental.RData",
+        processed_filename: str = "sia_mental_monthly.parquet",
+    ):
         self.data_path = os.path.join(DATA_DIR, data_filename)
+        self.processed_path = os.path.join(PROCESSED_DIR, processed_filename)
 
     def load(self) -> SIAData:
-        if not os.path.exists(self.data_path):
-            raise FileNotFoundError(
-                f"Arquivo não encontrado: {self.data_path}. Coloque o .RData em {DATA_DIR}."
-            )
-
-        r = pyreadr.read_r(self.data_path)
-        if not r:
-            raise ValueError("Não foi possível ler o .RData (arquivo vazio ou corrompido).")
-
-        # tenta pegar objeto esperado, senão o primeiro data.frame
-        df: Optional[pd.DataFrame] = None
-        if "RM15_SIA_Mental" in r:
-            df = r["RM15_SIA_Mental"]
+        # 1) Caminho preferencial (leve) para Render: parquet já agregado (pouquíssimas linhas)
+        if os.path.exists(self.processed_path):
+            serie = pd.read_parquet(self.processed_path, engine="pyarrow")
         else:
-            for _, obj in r.items():
-                if isinstance(obj, pd.DataFrame):
-                    df = obj
-                    break
+            # 2) Fallback: ler o .RData original (pode ser pesado). Ideal é pré-processar localmente.
+            if not os.path.exists(self.data_path):
+                raise FileNotFoundError(
+                    "Dados não encontrados. Opções:\n"
+                    f"- (recomendado) gere `{os.path.basename(self.processed_path)}` em `{PROCESSED_DIR}`\n"
+                    f"- ou coloque `{os.path.basename(self.data_path)}` em `{DATA_DIR}`\n"
+                )
 
-        if df is None or df.empty:
-            raise ValueError("Nenhum data.frame encontrado dentro do .RData.")
+            r = pyreadr.read_r(self.data_path)
+            if not r:
+                raise ValueError("Não foi possível ler o .RData (arquivo vazio ou corrompido).")
 
-        for col in ("pa_cmp", "RM_nome"):
-            if col not in df.columns:
-                raise ValueError(f"Coluna obrigatória ausente no dado: {col}")
+            # tenta pegar objeto esperado, senão o primeiro data.frame
+            df: Optional[pd.DataFrame] = None
+            if "RM15_SIA_Mental" in r:
+                df = r["RM15_SIA_Mental"]
+            else:
+                for _, obj in r.items():
+                    if isinstance(obj, pd.DataFrame):
+                        df = obj
+                        break
 
-        dff = df.copy()
-        dff["pa_cmp"] = dff["pa_cmp"].astype(str).str.strip()
-        dff["ano"] = pd.to_numeric(dff["pa_cmp"].str.slice(0, 4), errors="coerce")
-        dff["mes"] = pd.to_numeric(dff["pa_cmp"].str.slice(4, 6), errors="coerce")
-        dff = dff.dropna(subset=["ano", "mes", "RM_nome"])
-        dff["ano"] = dff["ano"].astype(int)
-        dff["mes"] = dff["mes"].astype(int)
-        dff["RM_nome"] = dff["RM_nome"].astype(str).str.strip()
-        dff = dff[(dff["mes"] >= 1) & (dff["mes"] <= 12)]
+            if df is None or df.empty:
+                raise ValueError("Nenhum data.frame encontrado dentro do .RData.")
 
-        serie = (
-            dff.groupby(["RM_nome", "ano", "mes"], as_index=False)
-            .size()
-            .rename(columns={"size": "casos_totais"})
-        )
-        serie["data"] = pd.to_datetime(
-            dict(year=serie["ano"], month=serie["mes"], day=1),
-            errors="coerce",
-        )
+            for col in ("pa_cmp", "RM_nome"):
+                if col not in df.columns:
+                    raise ValueError(f"Coluna obrigatória ausente no dado: {col}")
+
+            dff = df[["pa_cmp", "RM_nome"]].copy()
+            dff["pa_cmp"] = dff["pa_cmp"].astype(str).str.strip()
+            dff["ano"] = pd.to_numeric(dff["pa_cmp"].str.slice(0, 4), errors="coerce")
+            dff["mes"] = pd.to_numeric(dff["pa_cmp"].str.slice(4, 6), errors="coerce")
+            dff = dff.dropna(subset=["ano", "mes", "RM_nome"])
+            dff["ano"] = dff["ano"].astype(int)
+            dff["mes"] = dff["mes"].astype(int)
+            dff["RM_nome"] = dff["RM_nome"].astype(str).str.strip()
+            dff = dff[(dff["mes"] >= 1) & (dff["mes"] <= 12)]
+
+            serie = (
+                dff.groupby(["RM_nome", "ano", "mes"], as_index=False)
+                .size()
+                .rename(columns={"size": "casos_totais"})
+            )
+            serie["data"] = pd.to_datetime(
+                dict(year=serie["ano"], month=serie["mes"], day=1),
+                errors="coerce",
+            )
+            serie = serie.dropna(subset=["data"]).sort_values(["RM_nome", "data"])
+
+            # tenta salvar o agregado para próximas execuções (se houver permissão)
+            try:
+                os.makedirs(PROCESSED_DIR, exist_ok=True)
+                serie.to_parquet(self.processed_path, index=False, engine="pyarrow")
+            except Exception as e:
+                logger.warning("Não foi possível salvar parquet agregado: %s", e)
+
+        # Normalização mínima (caso o parquet venha de outra fonte)
+        required_cols = {"RM_nome", "ano", "mes", "casos_totais"}
+        missing = required_cols - set(serie.columns)
+        if missing:
+            raise ValueError(f"Parquet/agregado inválido. Colunas faltando: {sorted(missing)}")
+
+        if "data" not in serie.columns:
+            serie["data"] = pd.to_datetime(dict(year=serie["ano"], month=serie["mes"], day=1), errors="coerce")
         serie = serie.dropna(subset=["data"]).sort_values(["RM_nome", "data"])
 
         rms = sorted(serie["RM_nome"].unique().tolist())

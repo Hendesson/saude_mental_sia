@@ -5,3 +5,4 @@ numpy>=1.26.2
 plotly>=5.18.0
 gunicorn>=21.2.0
 pyreadr>=0.5.2
+pyarrow>=14.0.0
